@@ -19,9 +19,10 @@
 
   Python 3.8+
   依赖库：Pillow（用于 TIFF 到 PNG 转换）
+           pyarrow、pandas（仅按专利归并 Parquet 管线需要）
 
   安装依赖：
-    pip install Pillow
+    pip install Pillow pyarrow pandas
 
 ================================================================================
   项目文件说明
@@ -30,6 +31,9 @@
   核心脚本：
     build_corpus_records.py      解析 ZIP 包，生成语料记录（第一步）
     build_multimodal_sharegpt.py  构建多模态 ShareGPT 数据（第二步，主脚本）
+    build_patent_parquet.py       按专利归并各时期文件，生成 Parquet（新管线）
+    read_parquet.py               查看专利 Parquet 内容（只读查看工具，仅依赖 pyarrow）
+    verify_patent_parquet.py      校验 / 导出专利 Parquet
     build_multimodal_records.py   构建多模态记录索引
     build_multimodal_corpus.py    构建多模态语料
     inspect_zip_files.py          检查 ZIP 文件内容
@@ -39,12 +43,17 @@
     zipFiles/                     存放 PCT 文档 ZIP 压缩包
     tifFiles/                     直接存放 TIFF 图像文件（可选）
     xmlfiles/                     直接存放 XML 文件（可选）
+    专利 zip 源目录（默认）：
+    H:\BaiduNetdiskDownload\random_1000_patents/
 
   输出目录（脚本运行后自动生成）：
     corpus_records.json           语料记录中间文件
     multimodal_sharegpt/          最终输出目录
       images/                     PNG 图像文件
       *_sharegpt.json             ShareGPT 对话文件
+      index.json                  汇总索引
+    patent_parquet/               按专利归并的 Parquet 输出目录
+      WO*.parquet                 每个专利一个文件（内嵌页面图像）
       index.json                  汇总索引
 
 ================================================================================
@@ -165,6 +174,74 @@
   search-report      检索报告
 
 ================================================================================
+  操作指引：ZIP → Parquet（按专利归并）
+================================================================================
+
+  功能：扫描专利 zip 源目录（文件名形如 WO2014139619.zip、WO2014139619_1.zip，
+  下划线前为专利号，下划线后的数字为该专利的不同时期文件），把同一专利的全部
+  时期文档按文档内日期排序后归并，生成"每专利一个 Parquet 文件"。
+
+  步骤一：准备环境（首次使用）
+    安装依赖（生成 Parquet 需要 pyarrow、pandas）：
+
+      pip install Pillow pyarrow "pandas>=2.3,<3.0"
+
+    说明：若本机 NumPy 是 2.x，pyarrow 需 >=16.1 且 pandas 需 >=2.3，否则会报
+    "_ARRAY_API not found" 之类的二进制不兼容错误。
+
+  步骤二：小样本试跑（建议先用少量专利验证）
+    运行：
+
+      python build_patent_parquet.py --patents WO2014139619,WO2017021797,WO2014140987
+
+    预期：patent_parquet/ 目录下生成 3 个 .parquet 文件和 index.json。
+
+  步骤三：查看与校验结果
+    列出全部 parquet 概要：
+
+      python read_parquet.py
+
+    查看单个专利详情（--view 可选 summary / schema / docs / conversations / images）：
+
+      python read_parquet.py --patent WO2017021797 --view summary
+      python read_parquet.py --patent WO2017021797 --view schema
+      python read_parquet.py --patent WO2017021797 --view docs
+      python read_parquet.py --patent WO2017021797 --view conversations --max-turns 20
+      python read_parquet.py --patent WO2017021797 --view images
+
+    把对话文本和 PNG 图像导出到文件夹，直接翻阅（生成 conversation.json /
+    conversation.txt / images/*.png）：
+
+      python verify_patent_parquet.py --patent WO2017021797 --export-dir ./parquet_preview
+
+    完整性校验（与源 zip 数、旧管线页数、对话交替等交叉核对；未安装 Pillow 时
+    会自动跳过 PNG 解码检查）：
+
+      python verify_patent_parquet.py --verify
+
+  步骤四：全量转换（确认无误后执行）
+    运行：
+
+      python build_patent_parquet.py
+
+    说明：源目录共约 1000 个专利、2 万个 zip，预计耗时数小时；输出总体积约等于
+    PNG 总量（数十 GB 量级），请预留磁盘空间。
+
+  build_patent_parquet.py 可选参数：
+    --zip-dir   专利 zip 源目录（默认 H:\BaiduNetdiskDownload\random_1000_patents）
+    --out-dir   输出目录（默认 ./patent_parquet）
+    --patents   逗号分隔的专利号白名单（只处理这些专利）
+    --limit     最多处理的专利数
+
+  输出文件：patent_parquet/WO{专利号}.parquet，每个文件 1 行，主要字段：
+    patent_no / application_no / publication_no  专利与申请标识
+    n_docs / n_pages / n_images                  文件数、页数、图像数
+    docs           各时期文档列表（序号、zip 名、kind、日期、表单、页数等）
+    conversations  归并后的整条 ShareGPT 对话（human/gpt 交替，格式与现有管线一致）
+    images         页面图像元数据（文件名、宽高、sha256 等）
+    image_bytes    内嵌的 PNG 页面字节（与 images 一一对应）
+
+================================================================================
   数据处理流程
 ================================================================================
 
@@ -230,6 +307,8 @@
   需要上传到仓库的文件：
     build_corpus_records.py
     build_multimodal_sharegpt.py
+    build_patent_parquet.py
+    verify_patent_parquet.py
     build_multimodal_records.py
     build_multimodal_corpus.py
     inspect_zip_files.py
@@ -242,6 +321,7 @@
     tifFiles/          - TIFF 图像文件
     xmlfiles/          - XML 文件
     multimodal_sharegpt/  - 生成的输出文件
+    patent_parquet/    - 生成的专利 Parquet 文件
     sharegpt_output/   - 旧版输出文件
     *.json             - 各种生成的记录文件
     footer_samples/    - 页脚样本图片
@@ -261,5 +341,9 @@
 
   Q: 如何添加新的 ZIP 文件？
   A: 直接将新 ZIP 放入 zipFiles/ 目录，重新运行两个脚本即可。
+
+  Q: 运行 build_patent_parquet.py 报 NumPy 相关错误（如 "_ARRAY_API not found"）
+  A: pyarrow/pandas 与 NumPy 2.x 存在二进制兼容要求，请升级依赖：
+     pip install --upgrade pyarrow "pandas>=2.3,<3.0"
 
 ================================================================================
