@@ -15,8 +15,17 @@ from build_multimodal_sharegpt import (
     extract_tiff_from_zip,
     convert_tiff_to_png,
     build_conversations,
+    extract_flat_fields,
     get_form_description,
 )
+from export_mm_template import write_mm_parquet
+
+FORMAT_SHAREGPT = "sharegpt"
+FORMAT_MM = "mm"
+DEFAULT_OUT_DIR = {
+    FORMAT_SHAREGPT: "./patent_parquet",
+    FORMAT_MM: "./mm_template_parquet",
+}
 
 # zip 文件名:WO2014139619.zip 或 WO2014139619_1.zip
 # (下划线前为专利号,下划线后的数字为同一专利的不同时期文件序号)
@@ -113,9 +122,42 @@ def extract_pub_info(zip_path):
     return kind, pub_date
 
 
-def build_doc(record, zip_path):
+def build_doc_text(record):
+    """从 XML 结构化字段生成文档正文,供 mm_template 的 文本 列使用。"""
+    parts = []
+    form = record.get("form") or {}
+    if any(form.get(k) for k in ("type", "version", "lang")):
+        parts.append(f"这是一份{get_form_description(form)}。")
+        extra = []
+        if record.get("application_no"):
+            extra.append(f"国际申请号：{record['application_no']}")
+        if record.get("file_reference_id"):
+            extra.append(f"文件参考ID：{record['file_reference_id']}")
+        if record.get("publication_no"):
+            extra.append(f"公开号：{record['publication_no']}")
+        if extra:
+            parts.append("\n".join(extra))
+
+    structured = record.get("structured")
+    if structured:
+        field_parts = []
+        for key, value in extract_flat_fields(structured).items():
+            if "@" in key or len(str(value)) > 200:
+                continue
+            simple_key = key.split(".")[-1]
+            if simple_key.isdigit():
+                bits = key.split(".")
+                simple_key = bits[-2] if len(bits) > 1 else key
+            field_parts.append(f"{simple_key}: {value}")
+        if field_parts:
+            parts.append("\n".join(field_parts))
+    return "\n\n".join(parts) or None
+
+
+def build_doc(record, zip_path, include_conversations=True):
     """基于 analyze_zip_deep 的分析结果构建单个时期文档:
-    补充 kind/pub_date,提取 TIFF 转 PNG 字节,生成该文档的 ShareGPT 对话段。"""
+    补充 kind/pub_date,提取 TIFF 转 PNG 字节;
+    include_conversations 时生成该文档的 ShareGPT 对话段。"""
     kind, pub_date = extract_pub_info(zip_path)
 
     images = []
@@ -140,9 +182,7 @@ def build_doc(record, zip_path):
             page_errors.append(f"page {idx} ({page['file']}): {e}")
 
     form = record.get("form") or {}
-    conversations = build_conversations(record, image_dir="")
-
-    return {
+    doc = {
         "seq": record.get("sequence_no"),
         "zip_name": record["zip_name"],
         "kind": kind,
@@ -154,12 +194,15 @@ def build_doc(record, zip_path):
         "image_files": [img["path"] for img in images],
         "has_xml": bool(record.get("xml_info")),
         "error": "; ".join(filter(None, [record.get("error"), *page_errors])) or None,
-        # 内部字段(写入 parquet 前移除)
+        # 内部字段(写入 sharegpt parquet 前移除)
         "application_no": record.get("application_no"),
         "images": images,
         "image_bytes": image_bytes_list,
-        "conversations": conversations,
+        "xml_text": build_doc_text(record),
     }
+    if include_conversations:
+        doc["conversations"] = build_conversations(record, image_dir="")
+    return doc
 
 
 def _doc_form_desc(doc):
@@ -238,7 +281,7 @@ def merge_conversations(patent_no, publication_no, application_no, docs):
     return conversations
 
 
-def process_patent(patent_no, publication_no, zip_names, zip_dir):
+def process_patent(patent_no, publication_no, zip_names, zip_dir, include_conversations=True):
     """处理一个专利的全部时期 zip,返回该专利的 parquet 行数据。"""
     docs = []
     errors = []
@@ -247,7 +290,7 @@ def process_patent(patent_no, publication_no, zip_names, zip_dir):
         zip_path = os.path.join(zip_dir, zip_name)
         try:
             record = analyze_zip_deep(zip_path)
-            docs.append(build_doc(record, zip_path))
+            docs.append(build_doc(record, zip_path, include_conversations=include_conversations))
         except Exception as e:
             errors.append(f"{zip_name}: {e}")
             print(f"    [错误] {zip_name}: {e}")
@@ -261,7 +304,9 @@ def process_patent(patent_no, publication_no, zip_names, zip_dir):
 
     application_no = next((d["application_no"] for d in docs if d.get("application_no")), None)
 
-    conversations = merge_conversations(patent_no, publication_no, application_no, docs)
+    conversations = []
+    if include_conversations:
+        conversations = merge_conversations(patent_no, publication_no, application_no, docs)
 
     # 拆出各文档的图像元数据与字节,并移除内部字段
     images = []
@@ -271,6 +316,8 @@ def process_patent(patent_no, publication_no, zip_names, zip_dir):
         image_bytes_list.extend(d.pop("image_bytes"))
         d.pop("application_no", None)
         d.pop("conversations", None)
+        if include_conversations:
+            d.pop("xml_text", None)
 
     row = {
         "patent_no": patent_no,
@@ -288,10 +335,30 @@ def process_patent(patent_no, publication_no, zip_names, zip_dir):
 
 
 def write_patent_parquet(row, out_path):
-    """把单个专利的行数据写入 parquet 文件。"""
+    """把单个专利的行数据写入 ShareGPT parquet 文件(每专利 1 行)。"""
     row["docs"] = [{k: d.get(k) for k, _ in DOC_FIELDS} for d in row["docs"]]
     table = pa.Table.from_pylist([row], schema=SCHEMA)
     pq.write_table(table, out_path, compression="zstd")
+
+
+def write_patent_output(row, out_path, fmt):
+    """按 fmt 写出一个专利的 parquet: sharegpt 或 mm。
+
+    sharegpt: 每专利 1 行,含 conversations / 内嵌图像列表。
+    mm: mm_template 一块一行 (image-text-pair / text),图片为 struct<bytes,path>。
+    返回 {"format", "n_rows", "n_turns"} 便于日志。
+    """
+    if fmt == FORMAT_MM:
+        blocks = write_mm_parquet(row, out_path)
+        return {"format": FORMAT_MM, "n_rows": len(blocks), "n_turns": 0}
+    if fmt == FORMAT_SHAREGPT:
+        write_patent_parquet(row, out_path)
+        return {
+            "format": FORMAT_SHAREGPT,
+            "n_rows": 1,
+            "n_turns": len(row.get("conversations") or []),
+        }
+    raise ValueError(f"未知输出格式: {fmt} (应为 {FORMAT_SHAREGPT} 或 {FORMAT_MM})")
 
 
 def main():
@@ -299,13 +366,19 @@ def main():
         description="按专利归并各时期 zip 文件,每个专利生成一个内嵌页面图像的 parquet。")
     parser.add_argument("--zip-dir", default=r"H:\BaiduNetdiskDownload\random_1000_patents",
                         help="专利 zip 源目录")
-    parser.add_argument("--out-dir", default="./patent_parquet",
-                        help="parquet 输出目录")
+    parser.add_argument("--out-dir", default=None,
+                        help="parquet 输出目录 (默认: sharegpt -> ./patent_parquet, "
+                             "mm -> ./mm_template_parquet)")
+    parser.add_argument("--format", choices=[FORMAT_SHAREGPT, FORMAT_MM],
+                        default=FORMAT_SHAREGPT,
+                        help="输出格式: sharegpt=每专利一行对话+内嵌图; "
+                             "mm=mm_template 一块一行 (默认 sharegpt)")
     parser.add_argument("--patents", default=None,
                         help="逗号分隔的专利号白名单,如 WO2014139619,WO2017021797;不传则处理全部")
     parser.add_argument("--limit", type=int, default=None,
                         help="最多处理的专利数")
     args = parser.parse_args()
+    args.out_dir = args.out_dir or DEFAULT_OUT_DIR[args.format]
 
     # 扫描源目录并按专利号分组
     groups = defaultdict(list)
@@ -319,7 +392,8 @@ def main():
         groups[parsed["patent_no"]].append(name)
         zip_count += 1
 
-    print(f"源目录中发现 {len(groups)} 个专利、{zip_count} 个 zip 文件。")
+    print(f"源目录中发现 {len(groups)} 个专利、{zip_count} 个 zip 文件。"
+          f" 输出格式={args.format}, 目录={args.out_dir}")
 
     if args.patents:
         wanted = [p.strip() for p in args.patents.split(',') if p.strip()]
@@ -345,10 +419,13 @@ def main():
         print(f"\n[{i}/{len(groups)}] 处理专利 {patent_no} ({len(zip_names)} 个 zip)...")
         publication_no = parse_zip_name(zip_names[0])["publication_no"]
 
-        row, errors = process_patent(patent_no, publication_no, zip_names, args.zip_dir)
+        row, errors = process_patent(
+            patent_no, publication_no, zip_names, args.zip_dir,
+            include_conversations=(args.format == FORMAT_SHAREGPT),
+        )
 
         out_path = os.path.join(args.out_dir, f"{patent_no}.parquet")
-        write_patent_parquet(row, out_path)
+        written = write_patent_output(row, out_path, args.format)
         generated_files.append(os.path.basename(out_path))
 
         stats["total_docs"] += row["n_docs"]
@@ -357,18 +434,20 @@ def main():
         for err in errors:
             stats["errors"].append({"patent_no": patent_no, "error": err})
 
+        extra = (f"{written['n_turns']} 条对话" if args.format == FORMAT_SHAREGPT
+                 else f"{written['n_rows']} 块")
         print(f"  [完成] {row['n_docs']} 份文件、{row['n_pages']} 页、{row['n_images']} 张图、"
-              f"{len(row['conversations'])} 条对话 -> {out_path}")
+              f"{extra} -> {out_path}")
         if errors:
             print(f"  [警告] {len(errors)} 个 zip 处理失败")
 
     index_path = os.path.join(args.out_dir, "index.json")
     with open(index_path, 'w', encoding='utf-8') as f:
-        json.dump({"statistics": stats, "generated_files": generated_files},
+        json.dump({"format": args.format, "statistics": stats, "generated_files": generated_files},
                   f, ensure_ascii=False, indent=2)
 
     print("\n" + "-" * 60)
-    print(f"处理完成: {stats['total_patents']} 个专利 -> {args.out_dir}")
+    print(f"处理完成 ({args.format}): {stats['total_patents']} 个专利 -> {args.out_dir}")
     print(f"  文件数: {stats['total_docs']}, 页数: {stats['total_pages']}, 图像数: {stats['total_images']}")
     if stats["errors"]:
         print(f"  错误数: {len(stats['errors'])}")
