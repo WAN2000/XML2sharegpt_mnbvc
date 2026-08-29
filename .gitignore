@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+zipFiles/
+tifFiles/
+xmlfiles/
+multimodal_sharegpt/
+patent_parquet/
+mm_template_parquet/
+sharegpt_output/
+footer_samples/
+parquet_preview/
+*.json
+WO*.parquet
